@@ -3,101 +3,74 @@
  *******************************************************************************
  *
  * CONTEXTO:
- * Este script simula o monitoramento da tabela 'db_loja.cliente' para
- * alimentar um pipeline de dados em tempo real.
+ * Este script simula o monitoramento completo do ciclo de vida (INSERT, UPDATE,
+ * DELETE) de um registro na tabela 'db_loja.cliente'.
  *
  * OBJETIVO:
- * Validar a captura de eventos (INSERTs, UPDATEs) que seriam enviados
- * a um sistema externo (ex: CRM, Data Warehouse).
- *
- * EXECUÇÃO:
- * Este script é interativo. Execute cada "PASSO" separadamente e
- * observe os resultados antes de prosseguir.
+ * 1. Validar a captura de todos os tipos de eventos (INSERT, UPDATE, DELETE).
+ * 2. Entender o conceito de "Fila" (Consumir 'GET' vs. Espiar 'PEEK').
+ * 3. Entender o que é o LSN (Log Sequence Number) um "marcador de página" para a fila
  *
  *******************************************************************************/
 
 -- -----------------------------------------------------------------
+-- PRÉ-REQUISITO: Checar o Nível do WAL
+--
+-- O resultado DEVE ser 'logical'.
+--
+SHOW wal_level;
+
+-- -----------------------------------------------------------------
 -- CONFIGURAÇÃO INICIAL (Limpeza e Preparação)
 --
--- Garante que o ambiente de teste esteja limpo antes de começar.
-
--- (Limpa o slot de replicação se ele existir de uma execução anterior)
 SELECT pg_drop_replication_slot(slot_name)
 FROM pg_replication_slots
 WHERE slot_name = 'data_sync_slot';
 
--- (Limpa a publicação de dados se ela existir)
-DROP PUBLICATION IF EXISTS data_sync_pub;
-
---
--- PASSO 1: Definir a Fonte de Dados (PUBLICATION)
---
--- Criamos uma "Publicação" que age como um "canal".
--- Aqui, definimos que este canal *somente* transmitirá
--- mudanças da tabela 'db_loja.cliente'.
---
-CREATE PUBLICATION data_sync_pub FOR TABLE db_loja.cliente;
-
 -- -----------------------------------------------------------------
 --
+-- PASSO 1: Iniciar a Captura (REPLICATION SLOT)
 --
--- PASSO 2: Iniciar a Captura (REPLICATION SLOT)
---
--- Agora, criamos um "consumidor" (slot) para o canal.
--- A partir deste ponto, o PostgreSQL *reterá* todos os logs de
--- transação (WAL) para a tabela 'cliente', até que este
--- slot confirme que os consumiu.
+-- Criamos o "consumidor" (slot). A partir daqui, o Postgres
+-- começa a guardar as mudanças na "fila" deste slot.
 --
 SELECT pg_create_logical_replication_slot(
- 'data_sync_slot', -- Nome do slot consumidor
- 'pgoutput' -- Plugin de decodificação padrão
+ 'data_sync_slot',
+ 'test_decoding' -- Usamos 'test_decoding' pois ele gera saída em TEXTO, legível pela função
 );
 
 -- -----------------------------------------------------------------
 --
+-- PASSO 2: VERIFICAR O LSN INICIAL
 --
--- PASSO 3: SIMULAÇÃO DE TRANSAÇÃO (Novo Cadastro - INSERT)
+-- Vamos checar o "marcador de página" (LSN) do nosso slot.
+-- O 'restart_lsn' é o LSN (endereço) de onde o slot começará a ler.
 --
--- Um novo cliente (ID 99999) se cadastra no sistema.
+SELECT slot_name, restart_lsn
+FROM pg_replication_slots
+WHERE slot_name = 'data_sync_slot';
+
+-- -----------------------------------------------------------------
 --
+-- PASSO 3: SIMULAÇÃO DE TRANSAÇÕES (Enfileirando mudanças)
+--
+-- Cada COMMIT envia um novo conjunto de mensagens para a fila
+-- do 'data_sync_slot'.
+
+-- 3.1: Novo Cadastro (INSERT)
 BEGIN;
 INSERT INTO db_loja.cliente (id, nome, email, telefone, insert_date, is_delete)
 VALUES (
  99999,
- 'Cliente Novo P/ Teste CDC',
- 'cdc.novo@example.com',
+ 'Cliente P/ Teste CDC',
+ 'cdc.teste@example.com',
  '(11) 98765-4321',
  NOW(),
  false
 );
 COMMIT;
 
--- -----------------------------------------------------------------
---
--- PASSO 4: VERIFICAR A CAPTURA (Consumir o INSERT)
---
--- Consultamos o slot para "ler" as mudanças pendentes.
---
-SELECT * FROM pg_logical_slot_get_changes(
- 'data_sync_slot',
- NULL,
- NULL,
- 'publication_names',
- 'data_sync_pub'
-);
---
--- RESULTADO ESPERADO:
--- Você verá o 'BEGIN', o 'COMMIT' e, no meio, a linha de 'data'
--- com o "INSERT" e todos os dados do cliente (ID 99999).
--- O pipeline externo leria isso para criar o novo registro no CRM.
---
-
--- -----------------------------------------------------------------
---
--- PASSO 5: SIMULAÇÃO DE TRANSAÇÃO (Atualização de Perfil - UPDATE)
---
--- O mesmo cliente (ID 99999) atualiza seu número de telefone.
---
+-- 3.2: Atualização de Perfil (UPDATE)
 BEGIN;
 UPDATE db_loja.cliente
 SET
@@ -106,78 +79,112 @@ WHERE
  id = 99999;
 COMMIT;
 
--- -----------------------------------------------------------------
---
--- PASSO 6: VERIFICAR A CAPTURA (Consumir o UPDATE)
---
--- Lemos o slot novamente.
---
-SELECT * FROM pg_logical_slot_get_changes(
- 'data_sync_slot',
- NULL,
- NULL,
- 'publication_names',
- 'data_sync_pub'
-);
---
--- RESULTADO ESPERADO:
--- Você verá *APENAS* a transação de UPDATE. O INSERT do Passo 3
--- já foi "consumido" e saiu da fila.
--- O CRM usaria este evento para atualizar o registro existente.
---
-
--- -----------------------------------------------------------------
---
--- PASSO 7: SIMULAÇÃO DE TRANSAÇÃO (Anonimização LGPD/GDPR - UPDATE)
---
--- O cliente (ID 99999) solicita a exclusão de sua conta.
--- Em vez de um 'DELETE', a política da empresa é um "soft delete"
--- (anonimizando os dados) para manter o histórico de pedidos.
---
+-- 3.3: Remoção do Cliente (DELETE)
 BEGIN;
-UPDATE db_loja.cliente
-SET
- nome = 'Cliente Anonimizado',
- email = 'anonimizado@' || id::text || '.invalid',
- telefone = NULL,
- is_delete = true
+DELETE FROM db_loja.cliente
 WHERE
  id = 99999;
 COMMIT;
 
 -- -----------------------------------------------------------------
 --
+-- PASSO 4: O CONCEITO DE LSN (Log Sequence Number) e FILA
 --
--- PASSO 8: VERIFICAR A CAPTURA (Consumir a Anonimização)
+-- O que é o LSN (Log Sequence Number)?
+-- Pense no WAL (log de transações) como um livro-caixa "sequencial" onde cada transação é escrita.
+-- O LSN é o número da página e linha (o endereço exato) de cada transação dentro desse livro. É um ponteiro único e sempre crescente.
+--
+-- O LSN e a Fila (Slot):
+-- O slot (data_sync_slot) usa um LSN (restart_ls`) como marcador de página da sequencia de operações.
+--
+-- PEEK (Espiar): Apenas lê os dados. Não move o marcador.
+-- GET (Pegar): Lê os dados e **move o marcador para frente (consumindo a fila).
+--
+-- -----------------------------------------------------------------
+
+--
+-- PASSO 4.1: ESPIANDO A FILA (PEEK)
+--
+SELECT lsn, data
+FROM pg_logical_slot_peek_changes(
+ 'data_sync_slot',
+ NULL,
+ NULL
+);
+--
+-- RESULTADO ESPERADO:
+-- Você verá TODAS as 3 transações: INSERT, UPDATE e DELETE.
+--
+
+--
+-- PASSO 4.2: VERIFICANDO O MARCADOR DO SLOT (Após PEEK)
+--
+SELECT slot_name, restart_lsn
+FROM pg_replication_slots
+WHERE slot_name = 'data_sync_slot';
+--
+-- RESULTADO ESPERADO:
+-- O 'restart_lsn' será IDÊNTICO ao valor do PASSO 2.
+-- 'PEEK' não moveu o marcador de página.
+--
+
+--
+-- PASSO 4.3: CONSUMINDO A FILA (GET)
+--
+SELECT lsn, data
+FROM pg_logical_slot_get_changes(
+ 'data_sync_slot',
+ NULL,
+ NULL
+);
+--
+-- RESULTADO ESPERADO:
+-- Você verá as 3 transações. No momento em que esta consulta termina,
+-- o Postgres ATUALIZA o marcador de página do slot.
+--
+
+--
+-- PASSO 4.4: VERIFICANDO O MARCADOR DO SLOT (Após GET)
+--
+SELECT slot_name, restart_lsn
+FROM pg_replication_slots
+WHERE slot_name = 'data_sync_slot';
+--
+-- RESULTADO ESPERADO:
+-- SUCESSO! O 'restart_lsn' AVANÇOU para um novo endereço.
+-- O marcador de página foi movido. A fila está "consumida".
+--
+
+--
+-- PASSO 4.5: VERIFICANDO A FILA VAZIA (GET ou PEEK)
 --
 SELECT * FROM pg_logical_slot_get_changes(
  'data_sync_slot',
  NULL,
- NULL,
- 'publication_names',
- 'data_sync_pub'
+ NULL
 );
 --
 -- RESULTADO ESPERADO:
--- Você verá a transação de UPDATE final, com os novos
--- dados anonimizados, pronta para ser replicada no sistema externo.
+-- NENHUM DADO. A fila está vazia.
 --
 
 -- -----------------------------------------------------------------
--- PASSO 9: (OBRIGATÓRIO) DESATIVAR E LIMPAR O AMBIENTE
 --
--- IMPORTANTE: Slots de replicação ativos impedem o PostgreSQL
--- de limpar arquivos de log (WAL). Se um slot não for deletado
--- (ou consumido regularmente), ele pode encher o disco do servidor.
+-- PASSO 5: (OBRIGATÓRIO) DESATIVAR E LIMPAR O AMBIENTE
+--
+-- IMPORTANTE: Se você não deletar o slot, o Postgres nunca
+-- limpará os arquivos de log (WAL) associados a ele, e seu disco pode encher!
+-- 
+-- O slot guarda as operações (os arquivos de log WAL) para sempre, ou até acontecer uma destas duas coisas:
+-- Elas serem consumidas por um pg_logical_slot_get_changes (que move o marcador).
+-- O slot ser deletado (pg_drop_replication_slot).
+--
 
 -- 1. Desativa o slot de captura
 SELECT pg_drop_replication_slot('data_sync_slot');
 
--- 2. Remove a publicação
-DROP PUBLICATION data_sync_pub;
+-- (Linha de DROP PUBLICATION REMOVIDA)
 
--- 3. Limpa o registro de teste do banco
-DELETE FROM db_loja.cliente WHERE id = 99999;
 
 --
 -- Fim da Demonstração
